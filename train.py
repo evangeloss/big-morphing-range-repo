@@ -56,6 +56,7 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--output',type=Path,default=Path('results'))
     p.add_argument('--resume',action='store_true')
+    p.add_argument('--train-only',action='store_true',help='Train and validate; save models without final test evaluation')
     p.add_argument('--quick',action='store_true')
     p.add_argument('--large-alpha',type=float,default=.5)
     p.add_argument('--small-alpha',type=float,default=.02)
@@ -158,6 +159,9 @@ def main():
                         'epoch':epoch+1,'best':best,'best_epoch':best_epoch,'stale':stale,'history':history,'finished':finished},last)
                     print(f'{seed} {arm} {epoch+1}/{a.epochs}: train={total/a.steps:.5g}, val={val:.5g}, lr={opt.param_groups[0]["lr"]:.3g}',flush=True)
                     if finished:break
+                if a.train_only:
+                    del model,opt,scheduler
+                    continue
                 best_saved=torch.load(folder/'best.pt',map_location=device,weights_only=True)
                 load_state(model,best_saved['model'])
                 for snr in [0,10,20]:
@@ -168,6 +172,7 @@ def main():
                     errors.extend(dict(seed=seed,arm=arm,alpha=alpha,model_nmse=float(v),**m) for v,m in zip(values,meta))
                 write_csv(a.output/'summary.csv',summaries);write_csv(a.output/'per_scene_errors.csv',errors)
                 del model,opt,scheduler
+            if a.train_only:continue
             for kind in ['physics','mean_view','first_view']:
                 model=Baseline(bridges[label],kind)
                 for snr in [0,10,20]:
@@ -177,6 +182,18 @@ def main():
                         'nmse_db':float(10*np.log10(max(values.mean(),1e-30))),'p90_nmse':float(np.quantile(values,.9)),
                         'best_epoch':0,'trained_epochs':0})
                     errors.extend(dict(seed=seed,arm=arm,alpha=alpha,model_nmse=float(v),**m) for v,m in zip(values,meta))
+    if a.train_only:
+        (a.output/'parameter_counts.json').write_text(json.dumps(parameters,indent=2))
+        report=['# Training completed — final test evaluation not run',
+                f'Seeds: {a.seeds}. Large deformation: {a.large_alpha}. Small reference: {a.small_alpha}.',
+                'Four models per seed were trained from fresh initialization unless --resume was explicitly supplied.',
+                'Validation selected best.pt and controlled the learning rate; no test scenes were evaluated.',
+                'Keep the entire results directory, including bridge_*.pt, geometry.pt and seed_* checkpoints.',
+                'Use evaluate_sweep.py later to generate NMSE comparisons.']
+        (a.output/'TRAINING_COMPLETE.md').write_text('\n'.join(report),encoding='utf-8')
+        (a.output/'run_status.json').write_text(json.dumps({'completed':True,'training_completed':True,'test_evaluation_completed':False}))
+        print('\n'.join(report))
+        return
     write_csv(a.output/'summary.csv',summaries);write_csv(a.output/'per_scene_errors.csv',errors)
     (a.output/'parameter_counts.json').write_text(json.dumps(parameters,indent=2))
     rng=np.random.default_rng(712);gaps=[]
