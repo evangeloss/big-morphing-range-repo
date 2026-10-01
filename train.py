@@ -57,6 +57,8 @@ def main():
     p.add_argument('--output',type=Path,default=Path('results'))
     p.add_argument('--resume',action='store_true')
     p.add_argument('--train-only',action='store_true',help='Train and validate; save models without final test evaluation')
+    p.add_argument('--regimes',nargs='+',choices=['large','small'],default=['large','small'])
+    p.add_argument('--model-kinds',nargs='+',choices=['hybrid','direct'],default=['hybrid','direct'])
     p.add_argument('--quick',action='store_true')
     p.add_argument('--large-alpha',type=float,default=.5)
     p.add_argument('--small-alpha',type=float,default=.02)
@@ -81,7 +83,13 @@ def main():
         or not all(math.isfinite(v) for v in (a.small_alpha,a.large_alpha,a.gap_target_db))
         or not all(0<=s<1000 for s in a.seeds) or len(set(a.seeds))!=len(a.seeds)
         or a.epochs*a.steps>=100000):p.error('Invalid dimensions, seeds, amplitudes, or >=100000 training batches/seed')
+    if not a.train_only and (a.regimes!=['large','small'] or a.model_kinds!=['hybrid','direct']):
+        p.error('Subset training requires --train-only; use evaluate_sweep.py afterward')
+    regimes=[(label,getattr(a,f'{label}_alpha')) for label in dict.fromkeys(a.regimes)]
     config={k:str(v) if isinstance(v,Path) else v for k,v in vars(a).items() if k not in ('resume','output')}
+    # Preserve configuration compatibility with older full four-model runs.
+    if a.regimes==['large','small']:config.pop('regimes')
+    if a.model_kinds==['hybrid','direct']:config.pop('model_kinds')
     if a.output.exists() and any(a.output.iterdir()):
         if not a.resume:p.error('Output exists; use --resume or a new output directory')
         if json.loads((a.output/'configuration.json').read_text())!=config:p.error('Resume requires identical experiment settings')
@@ -97,7 +105,7 @@ def main():
     sim=Simulator(a.geometry_seed,a.paths,a.pair_start).to(device)
     torch.save(sim.state_dict(),a.output/'geometry.pt')
     bridges={};infos=[]
-    for label,alpha in [('large',a.large_alpha),('small',a.small_alpha)]:
+    for label,alpha in regimes:
         file=a.output/f'bridge_{label}.pt'
         if file.exists():
             saved=torch.load(file,map_location=device,weights_only=True)
@@ -111,8 +119,8 @@ def main():
     (a.output/'bridge_diagnostics.json').write_text(json.dumps(infos,indent=2))
     summaries=[];errors=[];parameters={}
     for seed in a.seeds:
-        for label,alpha in [('large',a.large_alpha),('small',a.small_alpha)]:
-            for kind in ['hybrid','direct']:
+        for label,alpha in regimes:
+            for kind in dict.fromkeys(a.model_kinds):
                 arm=f'{label}_{kind}';folder=a.output/f'seed_{seed}'/arm;folder.mkdir(parents=True,exist_ok=True)
                 torch.manual_seed(seed)
                 if device.type=='cuda':torch.cuda.manual_seed_all(seed)
@@ -185,8 +193,8 @@ def main():
     if a.train_only:
         (a.output/'parameter_counts.json').write_text(json.dumps(parameters,indent=2))
         report=['# Training completed — final test evaluation not run',
-                f'Seeds: {a.seeds}. Large deformation: {a.large_alpha}. Small reference: {a.small_alpha}.',
-                'Four models per seed were trained from fresh initialization unless --resume was explicitly supplied.',
+                f'Seeds: {a.seeds}. Trained deformation values (b/lambda): {[alpha for _,alpha in regimes]}.',
+                f'{len(regimes)*len(set(a.model_kinds))} models per seed; fresh initialization unless --resume was explicitly supplied.',
                 'Validation selected best.pt and controlled the learning rate; no test scenes were evaluated.',
                 'Keep the entire results directory, including bridge_*.pt, geometry.pt and seed_* checkpoints.',
                 'Use evaluate_sweep.py later to generate NMSE comparisons.']

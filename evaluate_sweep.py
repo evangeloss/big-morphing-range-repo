@@ -1,37 +1,17 @@
-"""Evaluate known-deformation checkpoints and plot three comparisons.
-
-Add beside simulator.py, bridge.py and model.py. No training files need editing.
-Example:
-  python evaluate_sweep.py --results results_b05 results_b1 --output sweep
-Requires FULL saved results directories, including .pt files, not review ZIPs.
-"""
+"""Physics transport + learned refinement, trained at a fixed large deformation."""
 import argparse
 import csv
-import hashlib
 import json
 import math
 import os
+import time
 from pathlib import Path
-os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG',':4096:8')
 import numpy as np
 import torch
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from simulator import Simulator
-from bridge import PhysicsBridge
+from simulator import Simulator,unpack,pack
+from bridge import build_bridge,PhysicsBridge
 from model import Reconstructor,nmse
-
-
-def digest(path):
-    h=hashlib.sha256()
-    with path.open('rb') as f:
-        for block in iter(lambda:f.read(1024*1024),b''):h.update(block)
-    return h.hexdigest()
-
-
-def same_state(left,right):
-    return left.keys()==right.keys() and all(torch.equal(left[k],right[k]) for k in left)
 
 
 def write_csv(path,rows):
@@ -39,180 +19,219 @@ def write_csv(path,rows):
         w=csv.DictWriter(f,fieldnames=list(rows[0]));w.writeheader();w.writerows(rows)
 
 
-def render(rows,gains,out,fixed_snrs):
-    methods=list(dict.fromkeys(r['method'] for r in rows))
-    names={'hybrid':'Physics + learned correction','physics':'Physics only','direct':'Direct prediction'}
-    alphas=sorted({r['alpha'] for r in rows})
-    colors=plt.get_cmap('viridis')(np.linspace(.08,.88,len(alphas)))
-    plt.rcParams.update({'font.size':10,'axes.spines.top':False,'axes.spines.right':False,'svg.fonttype':'none'})
-    def save(fig,name):
-        fig.tight_layout(rect=(0,.04,1,.93))
-        fig.text(.5,.015,'Mean linear NMSE is averaged across scenes and selected training seeds before dB conversion.',ha='center',fontsize=8)
-        for ext in ['png','pdf','svg']:fig.savefig(out/f'{name}.{ext}',dpi=190,bbox_inches='tight')
-        plt.close(fig)
-    for scale in ['linear','db']:
-        key='mean_nmse' if scale=='linear' else 'nmse_db'
-        ylabel='Mean NMSE (linear)' if scale=='linear' else 'NMSE (dB)'
-        fig,axs=plt.subplots(1,len(methods),figsize=(6*len(methods),5.5),squeeze=False)
-        for ax,method in zip(axs[0],methods):
-            for alpha,color in zip(alphas,colors):
-                rs=sorted([r for r in rows if r['method']==method and r['alpha']==alpha],key=lambda r:r['snr_db'])
-                ax.plot([r['snr_db'] for r in rs],[r[key] for r in rs],'o-',color=color,label=f'b/λ={alpha:g}')
-            ax.set(title=names[method],xlabel='SNR (dB)',ylabel=ylabel);ax.grid(alpha=.25);ax.legend(fontsize=8)
-            if scale=='linear':ax.set_ylim(bottom=0)
-        fig.suptitle('1. NMSE versus SNR — known deformation',fontsize=15)
-        save(fig,f'01_nmse_vs_snr_{scale}')
-        fig,axs=plt.subplots(1,len(methods),figsize=(6*len(methods),5.5),squeeze=False)
-        for ax,method in zip(axs[0],methods):
-            for snr in fixed_snrs:
-                rs=sorted([r for r in rows if r['method']==method and r['snr_db']==snr],key=lambda r:r['alpha'])
-                ax.plot([r['alpha'] for r in rs],[r[key] for r in rs],'o-',label=f'SNR={snr:g} dB')
-            ax.set(title=names[method],xlabel='Deformation b/λ',ylabel=ylabel);ax.grid(alpha=.25);ax.legend(fontsize=8)
-            if scale=='linear':ax.set_ylim(bottom=0)
-        fig.suptitle('2. NMSE versus deformation',fontsize=15)
-        save(fig,f'02_nmse_vs_deformation_{scale}')
-    fig,axs=plt.subplots(1,2,figsize=(12,5.5))
-    for alpha,color in zip(alphas,colors):
-        rs=sorted([r for r in gains if r['alpha']==alpha],key=lambda r:r['snr_db'])
-        axs[0].plot([r['snr_db'] for r in rs],[r['gain_db'] for r in rs],'o-',color=color,label=f'b/λ={alpha:g}')
-    for snr in fixed_snrs:
-        rs=sorted([r for r in gains if r['snr_db']==snr],key=lambda r:r['alpha'])
-        axs[1].plot([r['alpha'] for r in rs],[r['gain_db'] for r in rs],'o-',label=f'SNR={snr:g} dB')
-    for ax,xlabel in zip(axs,['SNR (dB)','Deformation b/λ']):
-        ax.axhline(0,color='black',linewidth=1,linestyle='--');ax.set(xlabel=xlabel,ylabel='Physics NMSE (dB) − hybrid NMSE (dB)')
-        ax.grid(alpha=.25);ax.legend(fontsize=8)
-    fig.suptitle('3. Gain from learned correction — positive is better',fontsize=15)
-    save(fig,'03_hybrid_gain')
+def state(model):return {k:v.detach().cpu() for k,v in model.state_dict().items() if not k.startswith('bridge.')}
+
+
+def load_state(model,s):
+    missing,unexpected=model.load_state_dict(s,strict=False)
+    assert not unexpected and all(k.startswith('bridge.') for k in missing)
+
+
+def save_checkpoint(obj,path):
+    tmp=path.with_suffix('.tmp');torch.save(obj,tmp);tmp.replace(path)
+
+
+@torch.no_grad()
+def evaluate(model,sim,alpha,n,batch,seed,snr=None):
+    model.eval();values=[];metadata=[]
+    for j,start in enumerate(range(0,n,batch)):
+        data=sim.batch(min(batch,n-start),seed+j,alpha,snr)
+        prediction=model(data['x'],data['variance'],data['scale'])
+        err=nmse(prediction,data['y'])
+        values.extend(err.cpu().tolist())
+        metadata.extend({'sample':start+i,'snr_db':float(data['snr'][i]),'rho':float(data['rho'][i]),
+                         'clean_difference':float(data['difference'][i])} for i in range(len(err)))
+    return np.asarray(values),metadata
+
+
+class Baseline(torch.nn.Module):
+    def __init__(self,bridge,kind):super().__init__();self.bridge=bridge;self.kind=kind
+    def forward(self,x,v,s):
+        if self.kind=='physics':return self.bridge(x,v)
+        if self.kind=='first_view':return x[:,:4]
+        return pack(unpack(x).mean(1,keepdim=True))
 
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--results',nargs='+',type=Path,required=True)
-    p.add_argument('--output',type=Path,default=Path('evaluation_sweep'))
-    p.add_argument('--snrs',nargs='+',type=float,default=[-5,0,5,10,15,20,25,30])
-    p.add_argument('--fixed-snrs',nargs='+',type=float,default=[0,10,20])
-    p.add_argument('--alphas',nargs='+',type=float,help='Optional subset of available trained amplitudes')
-    p.add_argument('--seeds',nargs='+',type=int,help='Default: common training seeds across all supplied runs')
-    p.add_argument('--scenes',type=int,default=500)
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--output',type=Path,default=Path('results'))
+    p.add_argument('--resume',action='store_true')
+    p.add_argument('--train-only',action='store_true',help='Train and validate; save models without final test evaluation')
+    p.add_argument('--regimes',nargs='+',choices=['large','small'],default=['large','small'])
+    p.add_argument('--model-kinds',nargs='+',choices=['hybrid','direct'],default=['hybrid','direct'])
+    p.add_argument('--quick',action='store_true')
+    p.add_argument('--large-alpha',type=float,default=.5)
+    p.add_argument('--small-alpha',type=float,default=.02)
+    p.add_argument('--seeds',nargs='+',type=int,default=[11])
+    p.add_argument('--epochs',type=int,default=100)
+    p.add_argument('--steps',type=int,default=64)
     p.add_argument('--batch-size',type=int,default=32)
-    p.add_argument('--evaluation-seed',type=int,default=3000000000)
-    p.add_argument('--include-direct',action='store_true')
-    p.add_argument('--allow-smoke',action='store_true',help='Allow checkpoints from --quick runs for software testing only')
-    p.add_argument('--device',choices=['auto','cpu','cuda'],default='auto')
+    p.add_argument('--validation-scenes',type=int,default=256)
+    p.add_argument('--test-scenes',type=int,default=300)
+    p.add_argument('--atoms',type=int,default=1024)
+    p.add_argument('--rank',type=int,default=384)
+    p.add_argument('--width',type=int,default=32)
+    p.add_argument('--paths',type=int,default=3)
+    p.add_argument('--geometry-seed',type=int,default=2026)
+    p.add_argument('--pair-start',type=int,default=0)
+    p.add_argument('--gap-target-db',type=float,default=2.)
     a=p.parse_args()
-    if a.scenes<1 or a.batch_size<1 or a.evaluation_seed<0:p.error('Positive scene/batch counts and nonnegative evaluation seed required')
-    if not all(math.isfinite(x) for x in a.snrs+a.fixed_snrs):p.error('SNRs must be finite')
-    a.snrs=sorted(set(a.snrs));a.fixed_snrs=sorted(set(a.fixed_snrs))
-    if not set(a.fixed_snrs).issubset(a.snrs):p.error('--fixed-snrs must be included in --snrs')
-    if a.output.exists() and any(a.output.iterdir()):p.error('Use a fresh output directory')
-    configs=[]
-    for root in a.results:
-        f=root/'configuration.json'
-        if not f.is_file():p.error(f'Missing {f}. Supply full results directories, not review ZIPs.')
-        cfg=json.loads(f.read_text());configs.append((root,cfg))
-        if cfg.get('quick') and not a.allow_smoke:p.error('Smoke-test checkpoints cannot be used for scientific evaluation')
-    reference=configs[0][1]
-    for root,cfg in configs:
-        for key in ['paths','geometry_seed','pair_start']:
-            if cfg[key]!=reference[key]:p.error(f'{key} differs across runs; use separate sweeps')
-    seeds=sorted(set(a.seeds)) if a.seeds else sorted(set.intersection(*(set(c['seeds']) for _,c in configs)))
-    if not seeds:p.error('No common training seeds. Pass compatible run directories.')
-    if any(not set(seeds).issubset(c['seeds']) for _,c in configs):p.error('Every run must contain all selected seeds')
-    sources={};duplicates=[]
-    for root,cfg in configs:
-        for regime in ['small','large']:
-            alpha=float(cfg[f'{regime}_alpha'])
-            if a.alphas is not None and not any(abs(alpha-x)<1e-9 for x in a.alphas):continue
-            candidate=(root,cfg,regime)
-            if alpha in sources:duplicates.append((alpha,sources[alpha],candidate))
-            else:sources[alpha]=candidate
-    if not sources:p.error('No requested trained amplitudes found')
-    if a.alphas and any(not any(abs(x-y)<1e-9 for y in sources) for x in a.alphas):p.error('A requested amplitude has no trained specialist; train it first')
-    kinds=['hybrid']+(['direct'] if a.include_direct else [])
-    # Compare tensor contents, not torch archive bytes, to deduplicate repeated small references.
-    for alpha,left,right in duplicates:
-        lb=torch.load(left[0]/f'bridge_{left[2]}.pt',map_location='cpu',weights_only=True)
-        rb=torch.load(right[0]/f'bridge_{right[2]}.pt',map_location='cpu',weights_only=True)
-        if not same_state({k:lb[k] for k in ['U','T','eigenvalues']},{k:rb[k] for k in ['U','T','eigenvalues']}):
-            p.error(f'Different bridges for duplicate alpha={alpha}. Supply only one source for that amplitude.')
-        for seed in seeds:
-            for kind in kinds:
-                ls=torch.load(left[0]/f'seed_{seed}'/f'{left[2]}_{kind}'/'best.pt',map_location='cpu',weights_only=True)['model']
-                rs=torch.load(right[0]/f'seed_{seed}'/f'{right[2]}_{kind}'/'best.pt',map_location='cpu',weights_only=True)['model']
-                if not same_state(ls,rs):p.error(f'Different checkpoints for duplicate alpha={alpha}; supply one source or use --alphas to select a subset')
-        print(f'Deduplicated identical reference at alpha={alpha:g}',flush=True)
-    device=torch.device(('cuda' if torch.cuda.is_available() else 'cpu') if a.device=='auto' else a.device)
-    torch.set_num_threads(min(4,torch.get_num_threads()))
-    sim=Simulator(reference['geometry_seed'],reference['paths'],reference['pair_start']).to(device)
-    for root,cfg,regime in sources.values():
-        saved=torch.load(root/'geometry.pt',map_location=device,weights_only=True)
-        if not same_state(sim.state_dict(),saved):p.error('Saved geometry differs from the expected simulator geometry')
-        for seed in seeds:
-            for kind in kinds:
-                if not (root/f'seed_{seed}'/f'{regime}_{kind}'/'best.pt').is_file():p.error(f'Missing checkpoint in {root}; review ZIPs exclude model weights')
+    if a.quick:
+        a.epochs=2;a.steps=2;a.batch_size=4;a.validation_scenes=8;a.test_scenes=8;a.atoms=32;a.rank=16;a.width=8;a.seeds=[11]
+    if (min(a.epochs,a.steps,a.batch_size,a.validation_scenes,a.test_scenes,a.atoms,a.rank,a.paths)<=0
+        or a.width%8 or a.width<8 or not 0<=a.pair_start<31 or not 0<=a.small_alpha<a.large_alpha
+        or not all(math.isfinite(v) for v in (a.small_alpha,a.large_alpha,a.gap_target_db))
+        or not all(0<=s<1000 for s in a.seeds) or len(set(a.seeds))!=len(a.seeds)
+        or a.epochs*a.steps>=100000):p.error('Invalid dimensions, seeds, amplitudes, or >=100000 training batches/seed')
+    if not a.train_only and (a.regimes!=['large','small'] or a.model_kinds!=['hybrid','direct']):
+        p.error('Subset training requires --train-only; use evaluate_sweep.py afterward')
+    regimes=[(label,getattr(a,f'{label}_alpha')) for label in dict.fromkeys(a.regimes)]
+    config={k:str(v) if isinstance(v,Path) else v for k,v in vars(a).items() if k not in ('resume','output')}
+    # Preserve configuration compatibility with older full four-model runs.
+    if a.regimes==['large','small']:config.pop('regimes')
+    if a.model_kinds==['hybrid','direct']:config.pop('model_kinds')
+    if a.output.exists() and any(a.output.iterdir()):
+        if not a.resume:p.error('Output exists; use --resume or a new output directory')
+        if json.loads((a.output/'configuration.json').read_text())!=config:p.error('Resume requires identical experiment settings')
     a.output.mkdir(parents=True,exist_ok=True)
-    manifest={'evaluation':{k:str(v) if isinstance(v,Path) else [str(x) for x in v] if k=='results' else v for k,v in vars(a).items()},
-              'selected_training_seeds':seeds,'device':str(device),'torch':torch.__version__,
-              'paired_scenes':'Same evaluation generator seeds, batch size and scene count for every alpha/SNR/model; repeated conditions are not independent scenes.',
-              'training_snr_reference':[0,10,20],'sources':[]}
-    aggregate=[];per_seed=[];all_arrays={}
-    with (a.output/'per_scene_errors.csv').open('w',newline='',encoding='utf-8') as f:
-        w=csv.DictWriter(f,fieldnames=['alpha','snr_db','method','training_seed','scene_id','nmse']);w.writeheader()
-        for alpha,(root,cfg,regime) in sorted(sources.items()):
-            bfile=root/f'bridge_{regime}.pt';b=torch.load(bfile,map_location=device,weights_only=True)
-            bridge=PhysicsBridge(b['U'],b['T'],b['eigenvalues']).to(device).eval()
-            models=[];files={str(bfile.resolve()):digest(bfile)}
-            for seed in seeds:
-                for kind in kinds:
-                    file=root/f'seed_{seed}'/f'{regime}_{kind}'/'best.pt'
-                    ck=torch.load(file,map_location=device,weights_only=True)
-                    model=Reconstructor(bridge,kind=='hybrid',cfg['width']).to(device)
-                    missing,unexpected=model.load_state_dict(ck['model'],strict=False)
-                    if unexpected or any(not k.startswith('bridge.') for k in missing):raise ValueError(f'Checkpoint mismatch: {file}')
-                    models.append((kind,seed,model.eval()));files[str(file.resolve())]=digest(file)
-            manifest['sources'].append({'alpha':alpha,'regime':regime,'configuration':cfg,'sha256':files})
-            for snr in a.snrs:
-                values={('physics',-1):[]};values.update({(kind,seed):[] for kind,seed,_ in models})
-                with torch.inference_mode():
-                    for j,start in enumerate(range(0,a.scenes,a.batch_size)):
-                        data=sim.batch(min(a.batch_size,a.scenes-start),a.evaluation_seed+j,alpha,snr)
-                        predictions=[('physics',-1,bridge(data['x'],data['variance']))]
-                        predictions += [(kind,seed,m(data['x'],data['variance'],data['scale'])) for kind,seed,m in models]
-                        for kind,seed,pred in predictions:
-                            errs=nmse(pred,data['y']).cpu().numpy()
-                            if not np.isfinite(errs).all():raise ValueError('Nonfinite evaluation errors')
-                            values[kind,seed].extend(errs.tolist())
-                            w.writerows(dict(alpha=alpha,snr_db=snr,method=kind,training_seed=seed,scene_id=start+i,nmse=float(e)) for i,e in enumerate(errs))
-                f.flush()
-                for (kind,seed),v in values.items():
-                    avg=float(np.mean(v));per_seed.append(dict(alpha=alpha,snr_db=snr,method=kind,training_seed=seed,
-                        scenes=len(v),mean_nmse=avg,nmse_db=10*math.log10(max(avg,1e-30))))
-                for kind in ['physics',*kinds]:
-                    matrix=np.asarray([v for (k,s),v in values.items() if k==kind]);avg=float(matrix.mean())
-                    all_arrays[alpha,snr,kind]=matrix
-                    aggregate.append(dict(alpha=alpha,snr_db=snr,method=kind,scenes=a.scenes,model_count=len(matrix),
-                        mean_nmse=avg,nmse_db=10*math.log10(max(avg,1e-30)),
-                        snr_relation='trained' if snr in [0,10,20] else 'interpolation' if 0<snr<20 else 'extrapolation'))
-                print(f'alpha={alpha:g}, SNR={snr:g}: complete ({a.scenes} paired scenes)',flush=True)
-            del models,bridge
-    gains=[]
-    for alpha in sorted(sources):
-        for snr in a.snrs:
-            physics=float(all_arrays[alpha,snr,'physics'].mean());hybrid=float(all_arrays[alpha,snr,'hybrid'].mean())
-            gains.append(dict(alpha=alpha,snr_db=snr,gain_db=10*math.log10(max(physics,1e-30)/max(hybrid,1e-30)),
-                              error_reduction_percent=100*(1-hybrid/max(physics,1e-30))))
-    write_csv(a.output/'summary.csv',aggregate);write_csv(a.output/'per_seed_summary.csv',per_seed);write_csv(a.output/'hybrid_gain.csv',gains)
-    (a.output/'evaluation_manifest.json').write_text(json.dumps(manifest,indent=2),encoding='utf-8')
-    render(aggregate,gains,a.output,a.fixed_snrs)
-    (a.output/'README.txt').write_text('Outputs 01: NMSE vs SNR. Outputs 02: NMSE vs deformation. Output 03: hybrid gain.\n'
-        'Linear plots use a linear y axis; dB plots use 10*log10(mean linear NMSE). Positive gain favors hybrid.\n'
-        'Only trained amplitudes were evaluated. Lines connect measured points, not additional evaluated conditions.\n'
-        'Physics has no training seed (-1 in CSV). Neural curves average linear errors over selected training seeds.\n'
-        'All curves use matched propagation/noise draws. Scene pairing depends on evaluation seed and batch size.\n'
-        'Training SNRs: 0,10,20 dB; other SNRs are interpolation or extrapolation, labelled in summary.csv.\n',encoding='utf-8')
+    (a.output/'configuration.json').write_text(json.dumps(config,indent=2))
+    (a.output/'run_status.json').write_text(json.dumps({'completed':False}))
+    device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    torch.set_num_threads(min(4,torch.get_num_threads()))
+    torch.backends.cudnn.benchmark=False
+    torch.backends.cudnn.deterministic=True
+    torch.use_deterministic_algorithms(True,warn_only=True)
+    (a.output/'environment.json').write_text(json.dumps({'device':str(device),'torch':torch.__version__,'numpy':np.__version__},indent=2))
+    sim=Simulator(a.geometry_seed,a.paths,a.pair_start).to(device)
+    torch.save(sim.state_dict(),a.output/'geometry.pt')
+    bridges={};infos=[]
+    for label,alpha in regimes:
+        file=a.output/f'bridge_{label}.pt'
+        if file.exists():
+            saved=torch.load(file,map_location=device,weights_only=True)
+            bridge=PhysicsBridge(saved['U'],saved['T'],saved['eigenvalues']);info=saved['info']
+        else:
+            print(f'Building physics bridge for alpha={alpha}',flush=True)
+            bridge,info=build_bridge(sim,alpha,a.atoms,a.rank)
+            torch.save({**{k:v.cpu() for k,v in bridge.state_dict().items()},'info':info},file)
+        bridges[label]=bridge.to(device);infos.append(info)
+        print(info,flush=True)
+    (a.output/'bridge_diagnostics.json').write_text(json.dumps(infos,indent=2))
+    summaries=[];errors=[];parameters={}
+    for seed in a.seeds:
+        for label,alpha in regimes:
+            for kind in dict.fromkeys(a.model_kinds):
+                arm=f'{label}_{kind}';folder=a.output/f'seed_{seed}'/arm;folder.mkdir(parents=True,exist_ok=True)
+                torch.manual_seed(seed)
+                if device.type=='cuda':torch.cuda.manual_seed_all(seed)
+                model=Reconstructor(bridges[label],kind=='hybrid',a.width).to(device)
+                parameters[arm]=sum(t.numel() for t in model.parameters())
+                opt=torch.optim.AdamW(model.parameters(),lr=3e-4,weight_decay=1e-4)
+                scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(opt,factor=.5,patience=8,min_lr=3e-6)
+                start=0;best=float('inf');best_epoch=0;stale=0;history=[];finished=False
+                last=folder/'last.pt'
+                if a.resume and last.exists():
+                    ck=torch.load(last,map_location=device,weights_only=False)
+                    load_state(model,ck['model']);opt.load_state_dict(ck['optimizer']);scheduler.load_state_dict(ck['scheduler'])
+                    start=ck['epoch'];best=ck['best'];best_epoch=ck['best_epoch'];stale=ck['stale'];history=ck['history'];finished=ck['finished']
+                else:
+                    initial,_=evaluate(model,sim,alpha,a.validation_scenes,a.batch_size,1000000000+seed*10000)
+                    best=float(initial.mean())
+                    save_checkpoint({'model':state(model),'epoch':0,'validation_nmse':best},folder/'best.pt')
+                    (folder/'initial_validation.json').write_text(json.dumps({'nmse':best}))
+                for epoch in range(start,a.epochs) if not finished else []:
+                    model.train();total=0.;clock=time.time()
+                    for step in range(a.steps):
+                        # All four arms receive matching latent scenes and standardized noise.
+                        data=sim.batch(a.batch_size,1000000+seed*100000+epoch*a.steps+step,alpha)
+                        opt.zero_grad(set_to_none=True)
+                        prediction=model(data['x'],data['variance'],data['scale'])
+                        loss=nmse(prediction,data['y']).mean()
+                        if not torch.isfinite(loss):raise RuntimeError(f'Nonfinite loss: {arm}, epoch {epoch}')
+                        loss.backward();torch.nn.utils.clip_grad_norm_(model.parameters(),1.)
+                        opt.step();total+=float(loss.detach())
+                    vals,_=evaluate(model,sim,alpha,a.validation_scenes,a.batch_size,1000000000+seed*10000)
+                    val=float(vals.mean())
+                    if not math.isfinite(val):raise RuntimeError('Nonfinite validation error')
+                    scheduler.step(val)
+                    if val<best:
+                        best=val;best_epoch=epoch+1;stale=0
+                        save_checkpoint({'model':state(model),'epoch':best_epoch,'validation_nmse':best},folder/'best.pt')
+                    else:stale+=1
+                    # At least 50 epochs, then stop only after sustained validation stagnation and LR reductions.
+                    finished=(epoch+1==a.epochs) or (epoch+1>=50 and stale>=25 and opt.param_groups[0]['lr']<=3.75e-5)
+                    history.append(dict(epoch=epoch+1,train_nmse=total/a.steps,validation_nmse=val,
+                                        learning_rate=opt.param_groups[0]['lr'],seconds=time.time()-clock))
+                    write_csv(folder/'history.csv',history)
+                    save_checkpoint({'model':state(model),'optimizer':opt.state_dict(),'scheduler':scheduler.state_dict(),
+                        'epoch':epoch+1,'best':best,'best_epoch':best_epoch,'stale':stale,'history':history,'finished':finished},last)
+                    print(f'{seed} {arm} {epoch+1}/{a.epochs}: train={total/a.steps:.5g}, val={val:.5g}, lr={opt.param_groups[0]["lr"]:.3g}',flush=True)
+                    if finished:break
+                if a.train_only:
+                    del model,opt,scheduler
+                    continue
+                best_saved=torch.load(folder/'best.pt',map_location=device,weights_only=True)
+                load_state(model,best_saved['model'])
+                for snr in [0,10,20]:
+                    values,meta=evaluate(model,sim,alpha,a.test_scenes,a.batch_size,2000000000+seed*10000,snr)
+                    summaries.append({'seed':seed,'arm':arm,'alpha':alpha,'snr_db':snr,'mean_nmse':float(values.mean()),
+                        'nmse_db':float(10*np.log10(max(values.mean(),1e-30))),'p90_nmse':float(np.quantile(values,.9)),
+                        'best_epoch':best_saved['epoch'],'trained_epochs':len(history)})
+                    errors.extend(dict(seed=seed,arm=arm,alpha=alpha,model_nmse=float(v),**m) for v,m in zip(values,meta))
+                write_csv(a.output/'summary.csv',summaries);write_csv(a.output/'per_scene_errors.csv',errors)
+                del model,opt,scheduler
+            if a.train_only:continue
+            for kind in ['physics','mean_view','first_view']:
+                model=Baseline(bridges[label],kind)
+                for snr in [0,10,20]:
+                    values,meta=evaluate(model,sim,alpha,a.test_scenes,a.batch_size,2000000000+seed*10000,snr)
+                    arm=f'{label}_{kind}'
+                    summaries.append({'seed':seed,'arm':arm,'alpha':alpha,'snr_db':snr,'mean_nmse':float(values.mean()),
+                        'nmse_db':float(10*np.log10(max(values.mean(),1e-30))),'p90_nmse':float(np.quantile(values,.9)),
+                        'best_epoch':0,'trained_epochs':0})
+                    errors.extend(dict(seed=seed,arm=arm,alpha=alpha,model_nmse=float(v),**m) for v,m in zip(values,meta))
+    if a.train_only:
+        (a.output/'parameter_counts.json').write_text(json.dumps(parameters,indent=2))
+        report=['# Training completed — final test evaluation not run',
+                f'Seeds: {a.seeds}. Trained deformation values (b/lambda): {[alpha for _,alpha in regimes]}.',
+                f'{len(regimes)*len(set(a.model_kinds))} models per seed; fresh initialization unless --resume was explicitly supplied.',
+                'Validation selected best.pt and controlled the learning rate; no test scenes were evaluated.',
+                'Keep the entire results directory, including bridge_*.pt, geometry.pt and seed_* checkpoints.',
+                'Use evaluate_sweep.py later to generate NMSE comparisons.']
+        (a.output/'TRAINING_COMPLETE.md').write_text('\n'.join(report),encoding='utf-8')
+        (a.output/'run_status.json').write_text(json.dumps({'completed':True,'training_completed':True,'test_evaluation_completed':False}))
+        print('\n'.join(report))
+        return
+    write_csv(a.output/'summary.csv',summaries);write_csv(a.output/'per_scene_errors.csv',errors)
+    (a.output/'parameter_counts.json').write_text(json.dumps(parameters,indent=2))
+    rng=np.random.default_rng(712);gaps=[]
+    for seed in a.seeds:
+        for kind in ['hybrid','direct','physics']:
+            for snr in [0,10,20]:
+                def get(label):return np.array([r['model_nmse'] for r in errors if r['seed']==seed and r['arm']==f'{label}_{kind}' and r['snr_db']==snr])
+                large,small=get('large'),get('small');ids=rng.integers(len(large),size=(1000,len(large)))
+                boot=10*np.log10(large[ids].mean(1)/small[ids].mean(1))
+                gap=float(10*np.log10(large.mean()/small.mean()))
+                gaps.append(dict(seed=seed,kind=kind,snr_db=snr,gap_db=gap,ci_low=float(np.quantile(boot,.025)),
+                                 ci_high=float(np.quantile(boot,.975)),within_requested_gap=gap<=a.gap_target_db))
+    write_csv(a.output/'deformation_gap.csv',gaps)
+    lines=['# Large deformation reconstruction',f'Quick smoke run: {a.quick}. Seeds: {a.seeds}.',
+           f'Large alpha={a.large_alpha}; matched small alpha={a.small_alpha}. Desired gap <= {a.gap_target_db} dB.',
+           'Scores below pool equal-size test sets across seeds before converting mean NMSE to dB.',
+           '| Model | SNR | Large NMSE dB | Small NMSE dB | Gap dB |','|---|---|---|---|---|']
+    for kind in ['hybrid','direct','physics','mean_view','first_view']:
+        for snr in [0,10,20]:
+            def score(label):return 10*np.log10(np.mean([r['mean_nmse'] for r in summaries if r['arm']==f'{label}_{kind}' and r['snr_db']==snr]))
+            large,small=score('large'),score('small')
+            lines.append(f'| {kind} | {snr} | {large:.3f} | {small:.3f} | {large-small:.3f} |')
+    lines+=['','Positive gap means large deformation is worse. Inspect both absolute errors and the gap.',
+            'One-seed results are preliminary. Paired scene intervals are conditional on each trained model and do not measure training-seed uncertainty.',
+            'Prior, geometry and receiver noise variances are assumed known. No test-scene angles/gains/delays enter the estimator.',
+            'The prior transport uses a finite-rank approximation and mean noise variance across views; it is not an oracle.',
+            'Fresh training scenes each step; trained epochs can differ due to validation stopping. Check learning curves and bridge diagnostics.']
+    (a.output/'PASTE_BACK.md').write_text('\n'.join(lines),encoding='utf-8')
     (a.output/'run_status.json').write_text(json.dumps({'completed':True}))
-    print('\nSaved plots (PNG/PDF/SVG), summaries and per-scene errors to',a.output.resolve())
-    print('To display in a notebook: from IPython.display import display, Image; display(Image(filename="'+str(a.output/'01_nmse_vs_snr_db.png')+'"))')
+    print('\n'.join(lines))
 
 
 if __name__=='__main__':main()
