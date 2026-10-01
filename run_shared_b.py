@@ -38,6 +38,12 @@ def dataset_batch(sim,bridge,n,seed,alpha,snr=None):
 def predict(model,d):return model(d['x'],d['base'],d['variance'],d['scale'],d['alpha'])
 
 
+def training_snr_batch(values,n,step,alpha_index,device):
+    # Rotate through every SNR for every amplitude; counts differ by at most one.
+    levels=torch.tensor(values,dtype=torch.float32,device=device)
+    return levels[(torch.arange(n,device=device)+step*n+alpha_index)%len(values)]
+
+
 @torch.no_grad()
 def assess(model,sim,bridge,alpha,snr,n,batch,seed):
     model.eval();neural=[];physics=[]
@@ -53,12 +59,13 @@ def main():
     p.add_argument('--output',type=Path,default=Path('shared_b_results'))
     p.add_argument('--alphas',nargs='+',type=float,default=[.01,.05,.1,.25,.4,.6,.75,.9])
     p.add_argument('--seeds',nargs='+',type=int,default=[11])
-    p.add_argument('--epochs',type=int,default=100)
+    p.add_argument('--epochs',type=int,default=40)
     p.add_argument('--steps',type=int,default=64)
     p.add_argument('--batch-size',type=int,default=32)
     p.add_argument('--validation-scenes',type=int,default=64,help='Scenes per amplitude/SNR validation condition')
     p.add_argument('--test-scenes',type=int,default=500)
-    p.add_argument('--snrs',nargs='+',type=float,default=[-5,0,5,10,15,20,25,30])
+    p.add_argument('--training-snrs',nargs='+',type=float,default=[-10,-5,0,5,10,15,20],help='SNRs used for both training and validation')
+    p.add_argument('--snrs',nargs='+',type=float,default=[-10,-5,0,5,10,15,20],help='Independent test SNRs')
     p.add_argument('--atoms',type=int,default=1024)
     p.add_argument('--rank',type=int,default=384)
     p.add_argument('--width',type=int,default=32)
@@ -67,17 +74,18 @@ def main():
     p.add_argument('--quick',action='store_true')
     a=p.parse_args()
     if a.quick:
-        a.epochs=2;a.steps=2;a.batch_size=2*len(a.alphas);a.validation_scenes=4;a.test_scenes=8;a.atoms=32;a.rank=16;a.width=8;a.seeds=[11]
+        a.epochs=2;a.steps=4;a.batch_size=2*len(a.alphas);a.validation_scenes=4;a.test_scenes=8;a.atoms=32;a.rank=16;a.width=8;a.seeds=[11]
     if (len(set(a.alphas))!=len(a.alphas) or any(not math.isfinite(v) or v<=0 for v in a.alphas)
         or a.batch_size%len(a.alphas) or min(a.epochs,a.steps,a.batch_size,a.validation_scenes,a.test_scenes,a.atoms,a.rank,a.width)<1
         or a.width%8 or len(set(a.seeds))!=len(a.seeds) or not all(0<=s<999 for s in a.seeds)
         or a.steps*a.epochs*len(a.alphas)>=1000000 or not {0,10,20}.issubset(a.snrs)
-        or not all(math.isfinite(v) for v in a.snrs)):
+        or len(set(a.training_snrs))!=len(a.training_snrs)
+        or not all(math.isfinite(v) for v in a.snrs+a.training_snrs)):
         p.error('Check settings: batch size must be divisible by the number of amplitudes; include SNRs 0,10,20')
-    a.snrs=sorted(set(a.snrs));out=a.output.resolve()
+    a.snrs=sorted(set(a.snrs));a.training_snrs=sorted(a.training_snrs);out=a.output.resolve()
     config={k:v for k,v in vars(a).items() if k not in ['output','resume','evaluate_only','snrs','test_scenes']}
     config.update({'architecture':'one_shared_hybrid_with_known_alpha','paths':3,'geometry_seed':2026,'pair_start':0,
-                   'training_snrs':[0,10,20],'selection':'macro mean linear validation NMSE over all amplitude/SNR conditions'})
+                   'snr_sampling':'balanced_rotation_v1','selection':'macro mean linear validation NMSE over all amplitude/SNR conditions'})
     if out.exists() and any(out.iterdir()):
         if not (a.resume or a.evaluate_only):p.error('Use a new output directory or --resume')
         if json.loads((out/'shared_configuration.json').read_text())!=config:p.error('Training settings differ from saved shared model')
@@ -112,7 +120,7 @@ def main():
         def validate(epoch):
             vals=[]
             for alpha in a.alphas:
-                for snr in [0,10,20]:
+                for snr in a.training_snrs:
                     v,_=assess(model,sim,banks[alpha],alpha,snr,a.validation_scenes,a.batch_size,3000000000+seed*10000)
                     value=float(v.mean());vals.append(value)
                     by_condition.append(dict(epoch=epoch,alpha=alpha,snr_db=snr,validation_nmse=value))
@@ -130,7 +138,8 @@ def main():
                 for step in range(a.steps):
                     # Equal examples from EVERY amplitude in EVERY optimization step.
                     groups=[dataset_batch(sim,banks[alpha],per_alpha,
-                        1000000+seed*1000000+(epoch*a.steps+step)*len(a.alphas)+i,alpha)
+                        1000000+seed*1000000+(epoch*a.steps+step)*len(a.alphas)+i,alpha,
+                        training_snr_batch(a.training_snrs,per_alpha,epoch*a.steps+step,i,device))
                         for i,alpha in enumerate(a.alphas)]
                     d={k:torch.cat([g[k] for g in groups]) for k in ['x','y','base','variance','scale','alpha']}
                     opt.zero_grad(set_to_none=True);loss=nmse(predict(model,d),d['y']).mean()
@@ -174,21 +183,21 @@ def main():
             gains.append(dict(alpha=alpha,snr_db=snr,gain_db=10*np.log10(means['physics']/means['hybrid']),
                               error_reduction_percent=100*(1-means['hybrid']/means['physics'])))
     write_csv(evaluation/'summary.csv',aggregate);write_csv(evaluation/'hybrid_gain.csv',gains)
-    render(aggregate,gains,evaluation,[0,10,20])
+    render(aggregate,gains,evaluation,[s for s in a.training_snrs if s in a.snrs])
     import matplotlib.pyplot as plt
     fig,ax=plt.subplots(figsize=(10,6))
     for seed in a.seeds:
         h=[r for r in global_history if int(r['seed'])==seed]
         for field,label,style in [('train_nmse','Train','-'),('validation_nmse','Macro validation','--')]:
             ax.plot([int(r['epoch']) for r in h],10*np.log10([float(r[field]) for r in h]),style,label=f'{label}, seed {seed}')
-    ax.set(xlabel='Epoch',ylabel='Mean NMSE (dB)',title='One shared network — joint training across all eight amplitudes')
+    ax.set(xlabel='Epoch',ylabel='Mean NMSE (dB)',title=f'One shared network — {len(a.alphas)} amplitudes, {len(a.training_snrs)} training SNRs')
     ax.legend();ax.grid(alpha=.25);fig.tight_layout()
     for ext in ['png','pdf','svg']:fig.savefig(evaluation/f'04_shared_learning_history.{ext}',dpi=180)
     plt.close(fig)
     report=['# One shared hybrid model',f'Trained amplitudes b/lambda: {a.alphas}',f'Training seeds: {a.seeds}',
         'One neural checkpoint per seed is used at EVERY amplitude. Physics matrices are fixed geometry-dependent operators, not separate neural networks.',
         'Balanced amplitudes in every batch; validation selects one checkpoint by macro mean linear NMSE over all amplitudes and training SNRs.',
-        'Training SNRs are 0,10,20 dB. Tests outside this range are noise-level extrapolation; all test deformation amplitudes were trained.',
+        f'Training and validation SNRs: {a.training_snrs} dB. Test SNRs: {a.snrs} dB. All test deformation amplitudes were trained.',
         'See evaluation/summary.csv and figures. Known geometry/noise/prior assumptions remain unchanged.']
     (out/'SHARED_MODEL.md').write_text('\n'.join(report),encoding='utf-8')
     (out/'sweep_status.json').write_text(json.dumps({'completed':True,'model_type':'one_shared_neural_network_per_seed','evaluation_folder':str(evaluation)}))

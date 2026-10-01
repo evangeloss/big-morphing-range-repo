@@ -60,7 +60,12 @@ class Simulator(nn.Module):
         if snr is None:
             # Balance across batches; random permutation does not change noise pairing between arms.
             snrs=torch.tensor([0.,10.,20.],device=self.pb.device)[(torch.arange(n,device=self.pb.device)+seed%3)%3]
-        else: snrs=torch.full((n,),float(snr),device=self.pb.device)
+        else:
+            snrs=torch.as_tensor(snr,dtype=power.dtype,device=self.pb.device)
+            if snrs.ndim==0:
+                snrs=snrs.expand(n)
+            if snrs.shape!=(n,) or not torch.isfinite(snrs).all():
+                raise ValueError('SNR must be a finite scalar or a vector with one value per scene')
         variance=power/10**(snrs[:,None]/10)
         # Inverse unitary pilots preserve iid complex Gaussian noise. Simulate directly after inversion.
         noise=torch.complex(torch.randn(clean.shape,device=self.pb.device,generator=g),
