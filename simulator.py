@@ -41,7 +41,7 @@ class Simulator(nn.Module):
         return ab[:,:,:,None,:]*au[:,:,None,:,:].conj()
 
     @torch.no_grad()
-    def batch(self,n,seed,alpha,snr=None):
+    def batch(self,n,seed,alpha,snr=None,return_latents=False):
         g=torch.Generator(device=self.pb.device).manual_seed(seed)
         db=self.directions(n,self.paths,g);du=self.directions(n,self.paths,g)
         beta=torch.complex(torch.randn(n,self.paths,device=self.pb.device,generator=g),
@@ -77,4 +77,24 @@ class Simulator(nn.Module):
         energy=target.abs().square().sum((2,3,4))
         rho=((clean.conj()*target).sum((2,3,4)).abs()/torch.sqrt(clean.abs().square().sum((2,3,4))*energy).clamp_min(1e-12)).mean(1)
         difference=((clean-target).abs().square().sum((2,3,4))/energy.clamp_min(1e-12)).mean(1)
-        return {'x':x,'y':y,'variance':variance,'scale':scale,'snr':snrs,'rho':rho,'difference':difference}
+        result = {
+        'x': x,
+        'y': y,
+        'variance': variance,
+        'scale': scale,
+        'snr': snrs,
+        'rho': rho,
+        'difference': difference,
+         }
+        if return_latents:
+            result.update({
+                'db': db,
+                'du': du,
+                'beta': beta,
+                'delay': delay,
+                'clean': clean,
+                'target': target,
+                'observed': observed,
+            })
+
+        return result
